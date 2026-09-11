@@ -22,10 +22,7 @@ from aiogram.types import (
 # --- НАСТРОЙКИ И ИНИЦИАЛИЗАЦИЯ ---
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8917900190:AAFumQWwiqD7CGDO5EmVU93TTiHHkoevnRY")
-
-# ВСТАВЬТЕ ССЫЛКУ ОТ NEON СЮДА (внутрь кавычек)
-# Например: "postgresql://alex:secret@ep-cool-darkness-123456.us-east-2.aws.neon.tech/neondb?sslmode=require"
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_TytE1aV3lMYp@ep-muddy-truth-axk4h1kx-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 GROUP_CHAT_ID = -1003910683430
 ADMIN_CHAT_ID = -1003910683430
@@ -53,7 +50,7 @@ class AdminStates(StatesGroup):
     waiting_change_category_text = State()
 
 
-# --- РАБОТА С БД POSTGRESQL (NEON) ---
+# --- РАБОТА С БД POSTGRESQL ---
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -156,7 +153,7 @@ def init_db():
                 "ᴏ чёʍ ᴏбычнᴏ ʍᴏᴧчᴀᴛ.\n"
                 "Ꮇᴏжнᴏ ᴏᴄᴛᴀʙиᴛь иᴄᴛᴏᴩию,\n"
                 "ʍыᴄᴧь иᴧи ᴨᴩᴏᴄᴛᴏ нᴇᴄᴋᴏᴧьᴋᴏ ᴄᴧᴏʙ.\n\n"
-                "Ꮋᴀбᴧюдᴀᴛᴇᴧь нᴇ ᴨᴩᴇᴩᴇбиʙᴀᴇᴛ.\n"
+                "Ꮋᴀбᴧюдᴀᴛᴇᴧь нᴇ ᴨᴇᴩᴇбиʙᴀᴇᴛ.\n"
                 "Ꮋᴀбᴧюдᴀᴛᴇᴧь нᴇ ᴏᴄуждᴀᴇᴛ.\n"
                 "Ꮋᴀбᴧюдᴀᴛᴇᴧь ᴨᴩᴏᴄᴛᴏ ᴄᴧуɯᴀᴇᴛ.\n\n"
                 "Ꮋᴏ ᴨᴏʍни:\n"
@@ -216,9 +213,7 @@ def register_user(user_id: int, username: str, full_name: str):
                 """
                 INSERT INTO users (user_id, username, full_name, admin_tag, topic_id, state, blocked, banned_by_admin, streak_count, last_active_date, streak_lost_days) 
                 VALUES (%s, %s, %s, NULL, NULL, NULL, 0, 0, 1, %s, 0)
-                ON CONFLICT (user_id) DO UPDATE SET 
-                    username = EXCLUDED.username, 
-                    full_name = EXCLUDED.full_name
+                ON CONFLICT (user_id) DO NOTHING
                 """,
                 (user_id, username, full_name, today_str),
             )
@@ -474,33 +469,23 @@ async def set_bot_commands(bot_instance: Bot):
     await bot_instance.set_my_commands(admin_group_commands, scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID))
 
 
-# --- ГЛОБАЛЬНЫЙ MIDDLEWARE ДЛЯ АВТОМАТИЧЕСКОЙ РЕГИСТРАЦИИ И ПРОВЕРКИ БЛОКИРОВОК ---
-@dp.message.outer_middleware()
+# Исправлено подключение middleware для aiogram 3.x
 @dp.callback_query.outer_middleware()
-async def auto_register_and_check_block(handler, event, data):
-    user = event.from_user
-    if user:
-        register_user(user.id, user.username, user.full_name)
-
+async def register_user_on_callback(handler, event: types.CallbackQuery, data):
+    if event.from_user:
+        user_id = event.from_user.id
+        register_user(user_id, event.from_user.username, event.from_user.full_name)
+        
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("SELECT 1 FROM admins WHERE user_id = %s", (user.id,))
-                has_tag = cursor.fetchone() is not None
+                cursor.execute("SELECT 1 FROM admins WHERE user_id = %s", (user_id,))
+                is_admin = cursor.fetchone() is not None
 
-        if not is_owner(user.id) and not has_tag:
-            with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT blocked FROM users WHERE user_id = %s", (user.id,))
-                    row = cursor.fetchone()
-                    is_blocked = row[0] if row else 0
-
-            if is_blocked == 1:
-                if isinstance(event, types.CallbackQuery):
-                    await event.answer("Вы заблокированы в этом боте!", show_alert=True)
-                elif isinstance(event, types.Message):
-                    await event.answer("Вы заблокированы в этом боте!")
+        if not is_owner(user_id) and not is_admin:
+            user = get_user(user_id)
+            if user and user[6] == 1:
+                await event.answer("Вы заблокированы в этом боте!", show_alert=True)
                 return
-
     return await handler(event, data)
 
 
@@ -519,6 +504,7 @@ async def cmd_admin_panel(message: types.Message, state: FSMContext):
 @dp.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
+    register_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     await message.answer(get_setting("welcome"), reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 
@@ -785,7 +771,7 @@ async def adm_broadcast_start(call: types.CallbackQuery, state: FSMContext):
             count = cursor.fetchone()[0]
     await state.set_state(AdminStates.broadcast_msg)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back")]])
-    await call.message.edit_text(f"📢 <b>Активных пользователей: {count}</b>\nПришлите или перешлите сообщение для рассылки (автор указан не будет).", reply_markup=kb, parse_mode="HTML")
+    await call.message.edit_text(f"📢 <b>Активных пользователей: {count}</b>\nПришлите сообщение для рассылки.", reply_markup=kb, parse_mode="HTML")
 
 
 @dp.message(AdminStates.broadcast_msg, F.chat.type == "private")
@@ -796,10 +782,8 @@ async def adm_broadcast_preview(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="🚀 Отправить", callback_data="confirm_bc_send")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="confirm_bc_cancel")],
     ])
-    await message.answer("🩸 Предпросмотр рассылки (так она придет пользователям — без имени автора):", parse_mode="HTML")
-    
-    await bot.copy_message(chat_id=message.chat.id, from_chat_id=message.chat.id, message_id=message.message_id)
-    
+    await message.answer("🩸 Предпросмотр рассылки:", parse_mode="HTML")
+    await message.copy_to(chat_id=message.chat.id)
     await message.answer("Отправляем?", reply_markup=kb)
 
 
@@ -814,15 +798,12 @@ async def adm_broadcast_execute(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     msg_id, from_chat = data["broadcast_msg_id"], data["from_chat_id"]
     await state.clear()
-    
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT user_id FROM users WHERE blocked = 0 AND banned_by_admin = 0")
             users = cursor.fetchall()
-            
     success, blocked = 0, 0
     await call.message.edit_text("⏳ Рассылка выполняется...")
-    
     for u in users:
         try:
             await bot.copy_message(chat_id=u[0], from_chat_id=from_chat, message_id=msg_id)
@@ -834,18 +815,19 @@ async def adm_broadcast_execute(call: types.CallbackQuery, state: FSMContext):
                     conn.commit()
             blocked += 1
         await asyncio.sleep(0.03)
-        
-    await call.message.answer(f"✅ Рассылка завершена!\nУспешно: {success}\nЗаблокировали (сразу учтено в статистике): {blocked}", reply_markup=get_admin_panel_kb())
+    await call.message.answer(f"✅ Рассылка завершена!\nУспешно: {success}\nЗаблокировали: {blocked}", reply_markup=get_admin_panel_kb())
 
 
 # --- ОБРАБОТКА ЛИЧНЫХ СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЕЙ ---
 @dp.message(F.chat.type == "private") 
 async def handle_private_message(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
+    # Безопасное сравнение состояний
     if current_state in [AdminStates.broadcast_msg.state, AdminStates.confirm_broadcast.state, AdminStates.write_review.state, AdminStates.edit_welcome.state, AdminStates.edit_rules.state]:
         return
 
     msg_text_or_caption = message.text or message.caption or ""
+    
     is_note = msg_text_or_caption.startswith("//")
 
     user = get_user(message.from_user.id)
