@@ -21,7 +21,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     MessageReactionUpdated,
-    ChatMemberUpdated,
 )
 
 # Загружает переменные из локального файла .env (если он есть)
@@ -221,7 +220,7 @@ def register_user(user_id: int, username: str, full_name: str):
                 """
                 INSERT INTO users (user_id, username, full_name, admin_tag, topic_id, state, blocked, banned_by_admin, streak_count, last_active_date, streak_lost_days) 
                 VALUES (%s, %s, %s, NULL, NULL, NULL, 0, 0, 1, %s, 0)
-                ON CONFLICT (user_id) DO UPDATE SET blocked = 0
+                ON CONFLICT (user_id) DO NOTHING
                 """,
                 (user_id, username, full_name, today_str),
             )
@@ -270,72 +269,6 @@ def log_msg(msg_type: str, user_id: int = None):
                     (user_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                 )
             conn.commit()
-
-
-# --- ПРОВЕРКА И СОЗДАНИЕ ТОПИКА ТОЛЬКО ЕСЛИ ОН УДАЛЕН НАВСЕГДА ---
-async def ensure_user_topic(user_id: int) -> int:
-    user = get_user(user_id)
-    if not user:
-        return None
-    
-    topic_id = user[14] if len(user) > 14 and user[14] else user[4]
-    admin_tag = user[3]
-    full_name = user[2] or "Без имени"
-    username = f"@{user[1]}" if user[1] else "нет юзера"
-
-    clean_admin_tag = html.escape(admin_tag if admin_tag else "Общий")
-    clean_name = html.escape(full_name)
-    clean_username = html.escape(username)
-    
-    topic_title = f"{clean_admin_tag} || {clean_name} || {clean_username} || {user_id}"
-
-    topic_exists = False
-    if topic_id:
-        try:
-            # Проверяем, существует ли топик в группе
-            await bot.edit_forum_topic(chat_id=GROUP_CHAT_ID, message_thread_id=topic_id, name=topic_title)
-            topic_exists = True
-        except Exception:
-            topic_exists = False
-
-    # Создаем новый топик ТОЛЬКО если старый был полностью удален администраторами вручную
-    if not topic_exists:
-        try:
-            new_topic = await bot.create_forum_topic(chat_id=GROUP_CHAT_ID, name=topic_title)
-            topic_id = new_topic.message_thread_id
-            with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "UPDATE users SET topic_id = %s, discussion_topic_id = %s WHERE user_id = %s",
-                        (topic_id, topic_id, user_id)
-                    )
-                    conn.commit()
-        except Exception as e:
-            logging.error(f"⚠️ Не удалось воссоздать удаленный топик для пользователя {user_id}: {e}")
-
-    return topic_id
-
-
-# --- ОТСЛЕЖИВАНИЕ РАЗБЛОКИРОВКИ БОТА ---
-@dp.my_chat_member()
-async def on_user_bot_blocked_or_unblocked(event: ChatMemberUpdated):
-    if event.chat.type != "private":
-        return
-    
-    user_id = event.from_user.id
-    new_status = event.new_chat_member.status
-    
-    if new_status == "member":
-        register_user(user_id, event.from_user.username, event.from_user.full_name)
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("UPDATE users SET blocked = 0 WHERE user_id = %s", (user_id,))
-                conn.commit()
-    elif new_status in ["kicked", "blocked"]:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("UPDATE users SET blocked = 1 WHERE user_id = %s", (user_id,))
-                conn.commit()
 
 
 # --- ЛОГИКА СТРИКОВ ---
@@ -757,7 +690,6 @@ async def cmd_my_tag(message: types.Message, state: FSMContext):
 async def process_change_admin(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     
-    # При смене администратора просто переименовываем существующий топик в «Смена администратора»
     user_info = get_user(call.from_user.id)
     if user_info:
         existing_topic_id = user_info[14] if len(user_info) > 14 and user_info[14] else (user_info[4] if len(user_info) > 4 else None)
@@ -1037,7 +969,7 @@ async def handle_private_message(message: types.Message, state: FSMContext):
             await message.answer(f"⚠️ Ошибка отправки заявки администраторам: {e}")
         return
 
-    if current_state == AdminStates.waiting_category_text.state:
+    if current_state == AdminStates.waiting_category_text.state or not assigned_admin:
         data = await state.get_data()
         category = data.get("chosen_category", "Общение")
         await state.clear()
@@ -1075,35 +1007,28 @@ async def handle_private_message(message: types.Message, state: FSMContext):
             await message.answer(f"⚠️ Ошибка отправки заявки администраторам: {e}")
         return
 
-    # Если администратор назначен, отправляем сообщение в его персональный топик
-    if assigned_admin:
-        try:
-            reply_to_in_group = None
-            if message.reply_to_message:
-                key_user = (message.chat.id, message.reply_to_message.message_id)
-                if key_user in msg_map:
-                    reply_to_in_group = msg_map[key_user][1]
+    try:
+        reply_to_in_group = None
+        if message.reply_to_message:
+            key_user = (message.chat.id, message.reply_to_message.message_id)
+            if key_user in msg_map:
+                reply_to_in_group = msg_map[key_user][1]
 
-            # Проверяем топик: если он был удален вручную, воссоздаем его, иначе используем существующий
-            target_thread_id = await ensure_user_topic(message.from_user.id)
+        target_thread_id = user[14] if len(user) > 14 and user[14] else (user[4] if len(user) > 4 else None)
 
-            copied = await bot.copy_message(
-                chat_id=GROUP_CHAT_ID,
-                message_thread_id=target_thread_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-                reply_to_message_id=reply_to_in_group
-            )
-            
-            msg_map[(message.chat.id, message.message_id)] = (GROUP_CHAT_ID, copied.message_id)
-            msg_map[(GROUP_CHAT_ID, copied.message_id)] = (message.chat.id, message.message_id)
-            return
+        copied = await bot.copy_message(
+            chat_id=GROUP_CHAT_ID,
+            message_thread_id=target_thread_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            reply_to_message_id=reply_to_in_group
+        )
+        
+        msg_map[(message.chat.id, message.message_id)] = (GROUP_CHAT_ID, copied.message_id)
+        msg_map[(GROUP_CHAT_ID, copied.message_id)] = (message.chat.id, message.message_id)
 
-        except Exception as e:
-            logging.error(f"⚠️ Ошибка пересылки в группу: {e}")
-
-    # Если администратора нет вообще, просим выбрать категорию
-    await message.answer("👀 Выберите категорию для общения, нажав кнопку ниже:", reply_markup=get_categories_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"⚠️ Ошибка пересылки в группу: {e}")
 
 
 @dp.callback_query(F.data.startswith("take_user_"))
@@ -1122,31 +1047,24 @@ async def process_take_user(call: types.CallbackQuery):
     admin_tag = admin_row[0]
     
     user_info = get_user(target_user_id)
+    existing_topic_id = user_info[14] if user_info and len(user_info) > 14 and user_info[14] else (user_info[4] if user_info and len(user_info) > 4 else None)
+
     clean_name = html.escape(user_info[2] if user_info and user_info[2] else "Без имени")
     clean_username = html.escape(f"@{user_info[1]}" if user_info and user_info[1] else "нет юзера")
     clean_admin_tag = html.escape(admin_tag)
 
     topic_title = f"{clean_admin_tag} || {clean_name} || {clean_username} || {target_user_id}"
 
-    existing_topic_id = user_info[14] if user_info and len(user_info) > 14 and user_info[14] else (user_info[4] if user_info and len(user_info) > 4 else None)
-
     try:
         if existing_topic_id:
-            # Если топик уже есть (например, переименованный при смене админа), просто обновляем его название на новый тег
             await bot.edit_forum_topic(chat_id=GROUP_CHAT_ID, message_thread_id=existing_topic_id, name=topic_title)
             final_topic_id = existing_topic_id
         else:
-            # Если топика нет вообще (первый раз), создаем новый
             new_topic = await bot.create_forum_topic(chat_id=GROUP_CHAT_ID, name=topic_title)
             final_topic_id = new_topic.message_thread_id
     except Exception as e:
         logging.error(f"⚠️ Ошибка создания/переименования топика: {e}")
-        try:
-            new_topic = await bot.create_forum_topic(chat_id=GROUP_CHAT_ID, name=topic_title)
-            final_topic_id = new_topic.message_thread_id
-        except Exception as ex:
-            logging.error(f"⚠️ Повторная ошибка создания топика: {ex}")
-            final_topic_id = existing_topic_id
+        final_topic_id = existing_topic_id
 
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
